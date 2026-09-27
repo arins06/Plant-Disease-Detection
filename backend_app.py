@@ -92,11 +92,29 @@ def init_db():
         conn.commit()
 
 
-def preprocess_image(raw_bytes: bytes) -> np.ndarray:
+def preprocess_image(raw_bytes: bytes) -> tuple:
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-    img = img.resize(IMG_SIZE)
-    arr = np.array(img, dtype=np.float32) / 255.0
-    return np.expand_dims(arr, axis=0)  # add batch dimension
+    resized = img.resize(IMG_SIZE)
+    arr = np.array(resized, dtype=np.float32) / 255.0
+    return np.expand_dims(arr, axis=0), img  # model input, plus original PIL image for the leaf-color check
+
+
+def looks_like_leaf(img: Image.Image, min_green_ratio: float = 0.12) -> bool:
+    """
+    Heuristic pre-filter: every training image is a leaf (green/brown) on some
+    background. This won't catch everything, but it catches the clear cases -
+    like a blown-out ceiling/wire photo with almost no green content - where
+    the CNN can still be confidently wrong since it was never trained to say
+    "this isn't a leaf at all."
+    """
+    hsv = img.resize((128, 128)).convert("HSV")
+    arr = np.array(hsv)
+    h, s, v = arr[..., 0], arr[..., 1], arr[..., 2]
+    # PIL's HSV hue is 0-255 for 0-360 degrees; green/yellow-green/brown-ish
+    # foliage roughly falls in ~35-140 on this scale, with some real saturation/brightness
+    green_mask = (h >= 25) & (h <= 140) & (s >= 35) & (v >= 25)
+    green_ratio = float(np.mean(green_mask))
+    return green_ratio >= min_green_ratio
 
 
 @app.on_event("startup")
@@ -111,9 +129,17 @@ async def predict(request: Request):
         raise HTTPException(status_code=400, detail="No image data received")
 
     try:
-        input_tensor = preprocess_image(raw_bytes)
+        input_tensor, original_img = preprocess_image(raw_bytes)
     except Exception:
         raise HTTPException(status_code=400, detail="Could not decode image")
+
+    if not looks_like_leaf(original_img):
+        return {
+            "status": "not_a_leaf",
+            "disease_class": None,
+            "confidence": None,
+            "message": "This doesn't look like a plant leaf - too little green/foliage color detected. Point the camera at an actual leaf.",
+        }
 
     predictions = get_model().predict(input_tensor)[0]
     class_index = int(np.argmax(predictions))
